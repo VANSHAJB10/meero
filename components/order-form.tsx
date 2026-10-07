@@ -1,0 +1,627 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  COUNTRY_OPTIONS,
+  PAYMENT_METHOD_LABELS,
+  normalizeCountry,
+  planForCountry,
+  type PaymentMethodId,
+} from "@/lib/pricing";
+import { paymentLinkFor } from "@/lib/payment-links";
+import { loadContactDetails, saveContactDetails } from "@/lib/contact-storage";
+import { sendWelcomeEmailRequest } from "@/lib/send-welcome-email-request";
+import { startRazorpayCheckout } from "@/lib/razorpay-checkout";
+import { readCountryCookie, writeCountryCookie } from "@/lib/country-cookie";
+import { CheckIcon } from "./check-icon";
+import { VideoPreview } from "./video-preview";
+import { OfferCountdown } from "./offer-countdown";
+import { FreeFiftyBanner } from "./free-fifty-banner";
+import { PROGRAMME_NAME } from "@/lib/site";
+
+const FIELD =
+  "h-12 w-full rounded-lg border border-neutral-90/15 bg-white px-4 font-noi-grotesk text-[16px] tracking-[-0.015em] outline-none transition-colors duration-150 focus:border-neutral-90";
+const LABEL = "font-noi-grotesk text-[14px] leading-[1.4] font-medium tracking-[-0.015em]";
+const ERROR = "font-noi-grotesk text-[14px] leading-[1.4] tracking-[-0.015em] text-[#c0392b]";
+
+const INCLUDED = [
+  "Four complete applications, web and mobile",
+  "Five skill areas: full stack, mobile, backend, database, deployment",
+  "Production deployment on Vercel, Hostinger VPS and Cloudflare",
+  "No prior coding experience needed",
+];
+
+type Status = "idle" | "sending" | "error" | "no-live-link";
+
+type AppliedCoupon = {
+  code: string;
+  discountType: "percent" | "fixed" | "free";
+  discountValue: number;
+  originalAmount: number;
+  discountedAmount: number;
+  currency: string;
+  isFree: boolean;
+};
+
+type CouponStatus = "idle" | "checking" | "applied" | "error";
+
+export function OrderForm({
+  initialCountry,
+  initialCoupon = "",
+}: {
+  initialCountry: string;
+  /** A code from ?coupon= in the link, applied on arrival. */
+  initialCoupon?: string;
+}) {
+  const [country, setCountry] = useState(() => normalizeCountry(initialCountry));
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  // Defaults to whichever method actually works for the visitor's starting
+  // country (Abzer for the Middle East set, Razorpay for India) rather than
+  // a hardcoded choice that's a dead end for most countries.
+  const [paymentMethodChoice, setPaymentMethodChoice] = useState<PaymentMethodId>(
+    () => planForCountry(normalizeCountry(initialCountry)).methods[0],
+  );
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [status, setStatus] = useState<Status>("idle");
+  const [errorMessage, setErrorMessage] = useState("");
+  const [couponInput, setCouponInput] = useState("");
+  const [couponStatus, setCouponStatus] = useState<CouponStatus>("idle");
+  const [couponError, setCouponError] = useState("");
+  const [appliedCoupon, setAppliedCoupon] = useState<AppliedCoupon | null>(null);
+
+  // A country handed over in the link (/order?country=uae) has to be published,
+  // not just used here.
+  //
+  // Everything else that quotes a price — the enrol bar, the offer banner, the
+  // pricing section — reads lib/use-country.ts, which reads the cookie. The
+  // form took the parameter straight from the server and told nobody, so a
+  // campaign link left the page quoting two currencies at once: AED 99 in the
+  // form and Rs999 in the bar across the bottom. Changing the select by hand
+  // never had this problem, because that path already writes the cookie.
+  //
+  // Only written when it actually differs, so arriving without a parameter
+  // does not rewrite the cookie with the value just read out of it.
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      const fromCookie = normalizeCountry(readCountryCookie());
+      if (country && country !== fromCookie) writeCountryCookie(country);
+    }, 0);
+    return () => window.clearTimeout(id);
+    // Mount only: later changes go through handleCountryChange, which already
+    // writes and broadcasts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // A code handed over in the link (/order?coupon=ABC123) applies itself, so
+  // somebody sent one personally never has to retype it — and sees the price
+  // already at zero rather than being asked to take our word for it.
+  //
+  // Runs once. `country` is deliberately not a dependency: changing it clears
+  // the coupon (a discount is priced per country), and re-applying here would
+  // fight that and put back a code the visitor had just dropped.
+  const autoApplied = useRef(false);
+  useEffect(() => {
+    if (!initialCoupon || autoApplied.current) return;
+    autoApplied.current = true;
+    setCouponInput(initialCoupon);
+    void applyCoupon(initialCoupon);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialCoupon]);
+
+  // One-time prefill from whichever form (this one, the enquiry modal, or the
+  // chat widget) was filled in first — see lib/contact-storage.ts. The
+  // setTimeout defers the setState out of the effect body itself (same
+  // pattern as the chat widget's reset-on-open), since localStorage only
+  // exists on the client and server/first-render markup must match.
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      const saved = loadContactDetails();
+      if (!saved) return;
+      setName(saved.name);
+      setEmail(saved.email);
+      setPhone(saved.phone);
+    }, 0);
+    return () => window.clearTimeout(id);
+  }, []);
+
+  const plan = useMemo(() => planForCountry(country), [country]);
+
+  // Derived, not synced via an effect: switching from AE (card and Razorpay,
+  // plus Abzer in some countries) to IN (Razorpay only) shouldn't leave a
+  // method selected with no matching button shown. That's a property of what's
+  // valid to render right now, not state that needs an effect keeping it in
+  // sync after the fact — an effect here would just cause an extra render on
+  // every country change for no benefit.
+  const paymentMethod = plan.methods.includes(paymentMethodChoice)
+    ? paymentMethodChoice
+    : plan.methods[0];
+
+  function handleCountryChange(next: string) {
+    setCountry(next);
+    // Persisted so a reload (or the next visit) keeps a manual override rather
+    // than snapping back to the geo-detected default — and broadcast, so every
+    // other price on the page moves with the form instead of leaving the page
+    // quoting two currencies at once.
+    writeCountryCookie(next);
+    // Re-derive rather than leaving the old choice selected — "Razorpay"
+    // carried over from India would otherwise sit checked (and non-
+    // functional) after switching to the UAE, since it's still a listed
+    // method there, just not a working one.
+    setPaymentMethodChoice(planForCountry(next).methods[0]);
+    // A coupon's discounted amount is priced per-country (see
+    // /api/coupon/validate) — clearing it here rather than trying to keep
+    // it in sync avoids showing a stale discount against the new price.
+    clearCoupon();
+  }
+
+  async function handleApplyCoupon(event: React.FormEvent) {
+    event.preventDefault();
+    await applyCoupon(couponInput);
+  }
+
+  async function applyCoupon(raw: string) {
+    const code = raw.trim();
+    if (!code) return;
+
+    setCouponStatus("checking");
+    setCouponError("");
+    try {
+      const res = await fetch("/api/coupon/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, country }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!data?.valid) {
+        setCouponStatus("error");
+        setCouponError(data?.error ?? "Invalid coupon code.");
+        setAppliedCoupon(null);
+        return;
+      }
+      setAppliedCoupon({ code: code.trim().toUpperCase(), ...data });
+      setCouponStatus("applied");
+    } catch {
+      setCouponStatus("error");
+      setCouponError("Could not check that code. Please try again.");
+    }
+  }
+
+  function clearCoupon() {
+    setAppliedCoupon(null);
+    setCouponStatus("idle");
+    setCouponInput("");
+    setCouponError("");
+  }
+
+  function validate() {
+    const errors: Record<string, string> = {};
+    if (name.trim().length < 2) errors.name = "Please enter your name.";
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim()))
+      errors.email = "Please enter a valid email address.";
+    // Not required: one less field between somebody and paying. A number that
+    // was actually typed still has to look like one, so a slip is caught here
+    // rather than stored as rubbish — /order/thank-you asks for it afterwards.
+    if (phone.trim() !== "" && phone.replace(/\D/g, "").length < 7)
+      errors.phone = "Please enter a valid phone number.";
+    setFieldErrors(errors);
+    return Object.keys(errors).length === 0;
+  }
+
+  async function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!validate()) return;
+
+    const contact = { name: name.trim(), email: email.trim(), phone: phone.trim() };
+    setStatus("sending");
+    console.info("Order", { ...contact, country, plan: plan.label, paymentMethod });
+    saveContactDetails(contact);
+    // Fired on form completion, not gated on payment — matches the enquiry
+    // modal and chat form, and still goes out even if checkout below fails.
+    sendWelcomeEmailRequest({ ...contact, country });
+
+    // A fully-covering coupon skips Razorpay entirely — it doesn't support
+    // ₹0 orders, and there's no live gateway for non-India plans anyway.
+    // See app/api/order/free-enroll for the server-side re-validation.
+    if (appliedCoupon?.isFree) {
+      try {
+        const res = await fetch("/api/order/free-enroll", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...contact, country, couponCode: appliedCoupon.code }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.enrolled) {
+          setErrorMessage(data?.error ?? "Could not complete free enrolment. Please try again.");
+          setStatus("error");
+          return;
+        }
+        window.location.href = "/order/thank-you";
+      } catch {
+        setErrorMessage("Could not complete free enrolment. Please try again.");
+        setStatus("error");
+      }
+      return;
+    }
+
+    if (paymentMethod === "razorpay") {
+      await startRazorpayCheckout({ ...contact, country, couponCode: appliedCoupon?.code }, {
+        // Full navigation, not a status flag — the thank-you page (with its
+        // own confetti + copy) IS the success state, same as how the
+        // static-link fallback below navigates away on success too. The IDs
+        // in the URL let that page offer an invoice download without us
+        // having to pass payment details through anything less disposable.
+        onSuccess: ({ orderId, paymentId, handoffToken }) => {
+          const query = new URLSearchParams({ orderId, paymentId });
+          // Passed straight through to the thank-you page, which hands it to
+          // /learn so the buyer lands inside the course already signed in.
+          if (handoffToken) query.set("ht", handoffToken);
+          window.location.href = `/order/thank-you?${query.toString()}`;
+        },
+        onError: (message) => {
+          setErrorMessage(message);
+          setStatus("error");
+        },
+        onDismiss: () => setStatus("idle"),
+      });
+      return;
+    }
+
+    if (paymentMethod === "stripe") {
+      try {
+        const res = await fetch("/api/stripe/create-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...contact, country, couponCode: appliedCoupon?.code }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.checkoutUrl) {
+          setErrorMessage(data?.error ?? "Could not start checkout. Please try again.");
+          setStatus("error");
+          return;
+        }
+        // Full redirect to Stripe's hosted page. The buyer comes back to
+        // /order/thank-you, but that is only a navigation — the payment is
+        // confirmed by app/api/stripe/webhook, never by the return trip.
+        window.location.href = data.checkoutUrl;
+      } catch {
+        setErrorMessage("Could not start checkout. Please try again.");
+        setStatus("error");
+      }
+      return;
+    }
+
+    if (paymentMethod === "abzer") {
+      try {
+        const res = await fetch("/api/abzer/create-order", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...contact, country, couponCode: appliedCoupon?.code }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.checkoutUrl) {
+          setErrorMessage(data?.error ?? "Could not start checkout. Please try again.");
+          setStatus("error");
+          return;
+        }
+        // Stashed so /order/payment-return knows which order to poll once
+        // Abzer sends the buyer back — its own redirect doesn't reliably
+        // carry this as a query param.
+        sessionStorage.setItem("abzerPendingOrderId", data.orderId);
+        // Full redirect to Abzer's hosted payment page — there's no in-page
+        // modal for this gateway. Abzer sends the buyer back to
+        // /order/payment-return once they're done; the actual payment
+        // confirmation arrives separately via webhook (see
+        // app/api/abzer/webhook), never from this redirect.
+        window.location.href = data.checkoutUrl;
+      } catch {
+        setErrorMessage("Could not start checkout. Please try again.");
+        setStatus("error");
+      }
+      return;
+    }
+
+    // NOTE: no real backend yet for these — point this at the real one (or a
+    // form service) alongside the simulated delay below.
+    await new Promise((r) => setTimeout(r, 500));
+    const link = paymentLinkFor(paymentMethod);
+    if (link) {
+      window.location.href = link;
+      return;
+    }
+    // No merchant account connected for this method yet — say so plainly
+    // rather than linking somewhere fake or dead.
+    setStatus("no-live-link");
+  }
+
+  return (
+    <main className="page-surface flex min-h-screen items-start justify-center overflow-x-clip px-6 pt-28 pb-20 md:pt-36 md:pb-32">
+      <div className="mx-auto grid w-full max-w-4xl gap-6 lg:grid-cols-2 lg:items-start">
+        <div className="flex flex-col gap-6 rounded-3xl bg-neutral-10 p-8 md:p-10">
+          <FreeFiftyBanner />
+
+          <div className="flex flex-col gap-2">
+            <span className="font-noi-grotesk text-[16px] leading-[1.4] tracking-[-0.015em] text-neutral-50">
+              {PROGRAMME_NAME}
+            </span>
+            {appliedCoupon ? (
+              <div className="flex flex-wrap items-baseline gap-3">
+                <span className="font-sans-plomb text-[28px] leading-[0.9] font-semibold tracking-[-0.015em] text-neutral-50 line-through">
+                  {plan.label}
+                </span>
+                <span className="font-sans-plomb text-[56px] leading-[0.9] font-semibold tracking-[-0.015em] text-[#5d7a00]">
+                  {appliedCoupon.isFree
+                    ? "FREE"
+                    : `${appliedCoupon.currency} ${appliedCoupon.discountedAmount}`}
+                </span>
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-baseline gap-3">
+                  {plan.originalLabel && (
+                    <span className="font-sans-plomb text-[28px] leading-[0.9] font-semibold tracking-[-0.015em] text-neutral-50 line-through">
+                      {plan.originalLabel}
+                    </span>
+                  )}
+                  <span className="font-sans-plomb text-[56px] leading-[0.9] font-semibold tracking-[-0.015em]">
+                    {plan.label}
+                  </span>
+                </div>
+                {/* Only against a struck-through price: a countdown next to a
+                    price that was never discounted is a deadline on nothing.
+                    Every plan that has one gets it, so INR reads the same as
+                    AED without either being spelled out here. */}
+                {plan.originalLabel && <OfferCountdown className="mt-1" />}
+              </>
+            )}
+          </div>
+
+          <form
+            onSubmit={handleApplyCoupon}
+            className="flex flex-col gap-2 border-t border-neutral-90/10 pt-6"
+          >
+            <label className={LABEL} htmlFor="order-coupon">
+              Coupon code
+            </label>
+            {appliedCoupon ? (
+              <div className="flex items-center justify-between gap-3 rounded-lg bg-lime-30/20 px-4 py-3">
+                <span className="font-noi-grotesk text-[14px] leading-[1.4] font-medium tracking-[-0.015em]">
+                  <span className="tabular-nums">{appliedCoupon.code}</span> applied —{" "}
+                  {appliedCoupon.isFree
+                    ? "free access"
+                    : appliedCoupon.discountType === "percent"
+                      ? `${appliedCoupon.discountValue}% off`
+                      : `${appliedCoupon.currency} ${appliedCoupon.discountValue} off`}
+                </span>
+                <button
+                  type="button"
+                  onClick={clearCoupon}
+                  className="shrink-0 font-noi-grotesk text-[13px] tracking-[-0.015em] text-neutral-50 underline underline-offset-2 hover:text-neutral-90"
+                >
+                  Remove
+                </button>
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <input
+                  id="order-coupon"
+                  value={couponInput}
+                  onChange={(e) => setCouponInput(e.target.value)}
+                  placeholder="Enter code"
+                  className={FIELD + " flex-1"}
+                  aria-invalid={couponStatus === "error"}
+                  aria-describedby={couponStatus === "error" ? "order-coupon-error" : undefined}
+                />
+                <button
+                  type="submit"
+                  disabled={couponStatus === "checking" || !couponInput.trim()}
+                  className="h-12 shrink-0 rounded-lg border border-neutral-90 px-4 font-noi-grotesk text-[14px] leading-none font-medium transition duration-150 ease-in-out hover:bg-neutral-90/8 disabled:opacity-60"
+                >
+                  {couponStatus === "checking" ? "Checking…" : "Apply"}
+                </button>
+              </div>
+            )}
+            {couponStatus === "error" && couponError && (
+              <p id="order-coupon-error" role="alert" className={ERROR}>
+                {couponError}
+              </p>
+            )}
+          </form>
+          <VideoPreview />
+
+          <ul className="flex list-none flex-col gap-3">
+            {INCLUDED.map((item) => (
+              <li key={item} className="flex max-w-full items-start gap-3">
+                <CheckIcon className="size-3 shrink-0 translate-y-2" />
+                <span className="shrink font-noi-grotesk text-[15px] leading-[1.4] tracking-[-0.015em]">
+                  {item}
+                </span>
+              </li>
+            ))}
+          </ul>
+
+          
+
+         
+        </div>
+
+        <form
+          onSubmit={handleSubmit}
+          noValidate
+          className="flex flex-col gap-5 rounded-3xl bg-neutral-10 p-8 md:p-10"
+        >
+          <div className="flex flex-col items-start gap-3">
+            <h1 className="font-noi-grotesk text-[26px] leading-[1.1] tracking-[-0.025em]">
+              Your details
+            </h1>
+            {/* AlreadyEnrolledGuard only bounces someone whose session is
+                already in hand. A buyer arriving signed out — an old link, an
+                ad, a second browser — would otherwise be looking at a page
+                asking them to buy what they own, with no way through to it. */}
+            <Link
+              href="/learn"
+              className="inline-flex min-h-10 w-full items-center justify-center rounded-lg border border-neutral-90/15 px-4 py-2.5 text-center font-noi-grotesk text-[14px] leading-[1.3] font-medium transition duration-150 ease-in-out hover:border-neutral-90 hover:bg-neutral-90/5 sm:w-auto"
+            >
+              Already enrolled? Start the course
+            </Link>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <label className={LABEL} htmlFor="order-name">
+              Full name
+            </label>
+            <input
+              id="order-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Your name"
+              autoComplete="name"
+              className={FIELD}
+              aria-invalid={Boolean(fieldErrors.name)}
+              aria-describedby={fieldErrors.name ? "order-name-error" : undefined}
+            />
+            {fieldErrors.name && (
+              <p id="order-name-error" role="alert" className={ERROR}>
+                {fieldErrors.name}
+              </p>
+            )}
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <label className={LABEL} htmlFor="order-email">
+              Email
+            </label>
+            <input
+              id="order-email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              autoComplete="email"
+              className={FIELD}
+              aria-invalid={Boolean(fieldErrors.email)}
+              aria-describedby={fieldErrors.email ? "order-email-error" : undefined}
+            />
+            {fieldErrors.email && (
+              <p id="order-email-error" role="alert" className={ERROR}>
+                {fieldErrors.email}
+              </p>
+            )}
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <label className={LABEL} htmlFor="order-phone">
+              Phone number <span className="text-neutral-50">(optional)</span>
+            </label>
+            <input
+              id="order-phone"
+              type="tel"
+              inputMode="tel"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="+971 50 000 0000"
+              autoComplete="tel"
+              className={FIELD}
+              aria-invalid={Boolean(fieldErrors.phone)}
+              aria-describedby={fieldErrors.phone ? "order-phone-error" : undefined}
+            />
+            {fieldErrors.phone && (
+              <p id="order-phone-error" role="alert" className={ERROR}>
+                {fieldErrors.phone}
+              </p>
+            )}
+          </div>
+           <div className="flex flex-col gap-2 border-t border-neutral-90/10 pt-6">
+            <label className={LABEL} htmlFor="order-country">
+              Country
+            </label>
+            <select
+              id="order-country"
+              value={country}
+              onChange={(e) => handleCountryChange(e.target.value)}
+              className={FIELD}
+            >
+              {COUNTRY_OPTIONS.map((c) => (
+                <option key={c.code} value={c.code}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+            <p className="font-noi-grotesk text-[13px] leading-[1.4] tracking-[-0.015em] text-neutral-50">
+              Sets your price and which payment methods are available.
+            </p>
+          </div>
+
+          <fieldset className="flex flex-col gap-2">
+            <legend className={LABEL}>How would you like to pay?</legend>
+            <div className="flex flex-wrap gap-2">
+              {plan.methods.map((method) => (
+                <label
+                  key={method}
+                  className="cursor-pointer rounded-full border border-neutral-90/15 px-4 py-2 font-noi-grotesk text-[14px] leading-none tracking-[-0.01em] transition-colors duration-150 has-checked:border-neutral-90 has-checked:bg-neutral-90 has-checked:text-white has-focus-visible:ring-2 has-focus-visible:ring-neutral-90 has-focus-visible:ring-offset-2"
+                >
+                  <input
+                    type="radio"
+                    name="paymentMethod"
+                    value={method}
+                    checked={paymentMethod === method}
+                    onChange={() => setPaymentMethodChoice(method)}
+                    className="sr-only"
+                  />
+                  {PAYMENT_METHOD_LABELS[method]}
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          {status === "no-live-link" && (
+            <p role="status" className="font-noi-grotesk text-[14px] leading-[1.4] tracking-[-0.015em] text-neutral-50">
+              We&rsquo;ve got your details. {PAYMENT_METHOD_LABELS[paymentMethod]}
+              {" "}isn&rsquo;t connected to a live payment link yet — the team will reach out
+              with how to complete payment.
+            </p>
+          )}
+          {status === "error" && (
+            <p role="alert" className={ERROR}>
+              {errorMessage || "Something went wrong. Please try again."}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={status === "sending"}
+            className="mt-1 inline-flex h-12 items-center justify-center rounded-lg bg-neutral-90 px-5 font-noi-grotesk text-[18px] leading-none font-medium text-white transition duration-150 hover:bg-neutral-70 disabled:opacity-60"
+          >
+            {status === "sending"
+              ? "Preparing…"
+              : appliedCoupon?.isFree
+                ? "Claim free access"
+                : "Buy now"}
+          </button>
+
+          {/* At the point of commitment, where the reassurance is worth most. */}
+          <p className="mt-3 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 font-noi-grotesk text-[13px] leading-none text-neutral-50">
+            <span className="inline-flex items-center gap-1.5">
+              <svg width="12" height="14" viewBox="0 0 12 14" fill="none" aria-hidden="true">
+                <path
+                  d="M3 6V4a3 3 0 0 1 6 0v2m-7 0h8a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z"
+                  stroke="currentColor"
+                  strokeWidth="1.3"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+              Secure checkout
+            </span>
+            <span aria-hidden="true" className="text-neutral-50/50">
+              ·
+            </span>
+            <span>7-day money-back guarantee</span>
+          </p>
+        </form>
+      </div>
+    </main>
+  );
+}

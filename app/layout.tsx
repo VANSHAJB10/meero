@@ -1,0 +1,195 @@
+import type { Metadata, Viewport } from "next";
+import Script from "next/script";
+import "./globals.css";
+import { SITE_DESCRIPTION, SITE_NAME, SITE_URL } from "@/lib/site";
+import { ldJson, siteGraph } from "@/lib/schema";
+import { ContactProvider } from "@/components/contact-dialog";
+import { EpisodeProvider } from "@/components/episode-dialog";
+import { DisableContextMenu } from "@/components/disable-context-menu";
+import { SiteChrome } from "@/components/site-chrome";
+import { AcademyAuthProvider } from "@/components/academy-auth";
+
+const TITLE = `${SITE_NAME} — Build AI powered applications`;
+
+export const metadata: Metadata = {
+  metadataBase: new URL(SITE_URL),
+  title: {
+    default: TITLE,
+    template: `%s — ${SITE_NAME}`,
+  },
+  description: SITE_DESCRIPTION,
+  applicationName: SITE_NAME,
+  keywords: [
+    "Delta AI Academy",
+    "learn to code with AI",
+    "AI coding bootcamp",
+    "vibe coding",
+    "Claude Code course",
+    "Lovable course",
+    "React bootcamp",
+    "React Native course",
+    "build apps without coding",
+  ],
+  authors: [{ name: SITE_NAME }],
+  creator: SITE_NAME,
+  publisher: SITE_NAME,
+  alternates: {
+    canonical: "/",
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: {
+      index: true,
+      follow: true,
+      "max-image-preview": "large",
+      "max-snippet": -1,
+      "max-video-preview": -1,
+    },
+  },
+  // No `icons` here on purpose. app/favicon.ico, app/icon.png and
+  // app/apple-icon.png are picked up by Next's file conventions, which emit
+  // one correctly-typed link each. Declaring icons in metadata as well
+  // replaced those: it produced three extra <link rel="icon"> tags pointing at
+  // the same .ico under two wrong size hints, and dropped the apple-touch-icon
+  // entirely. Google asks for a single favicon declaration, and iOS needs that
+  // apple link to put the logo on a home screen.
+  openGraph: {
+    type: "website",
+    url: "/",
+    siteName: SITE_NAME,
+    title: TITLE,
+    description: SITE_DESCRIPTION,
+    locale: "en_US",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: TITLE,
+    description: SITE_DESCRIPTION,
+  },
+  formatDetection: {
+    telephone: false,
+  },
+};
+
+/* The container id, in one place: the loader in <head> and the noscript
+   iframe in <body> have to name the same one. */
+const GTM_ID = "GTM-T9W3FGBC";
+
+export const viewport: Viewport = {
+  themeColor: "#ffffff",
+  colorScheme: "light",
+  width: "device-width",
+  initialScale: 1,
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en" className="h-full antialiased">
+      <head>
+        <link
+          rel="preload"
+          href="/fonts/SansPlomb-600.woff2"
+          as="font"
+          type="font/woff2"
+          crossOrigin="anonymous"
+        />
+
+        <link
+          rel="preload"
+          href="/fonts/NoiGrotesk-400.woff2"
+          as="font"
+          type="font/woff2"
+          crossOrigin="anonymous"
+        />
+
+        <link
+          rel="preload"
+          href="/fonts/NoiGrotesk-500.woff2"
+          as="font"
+          type="font/woff2"
+          crossOrigin="anonymous"
+        />
+
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{
+            __html: ldJson(siteGraph()),
+          }}
+        />
+
+        {/* Google Tag Manager. Last in <head> so the font preloads above are
+            the first thing the parser meets; the strategy, not the position,
+            is what decides when this runs. */}
+        <Script id="google-tag-manager" strategy="afterInteractive">
+          {`
+            (function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+            new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+            j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+            'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+            })(window,document,'script','dataLayer','${GTM_ID}');
+          `}
+        </Script>
+      </head>
+
+      <body className="min-h-full">
+        {/* Google Tag Manager, for browsers running without JavaScript. It has
+            to be the first thing in <body>, and it is plain markup rather than
+            a <Script>, since the point is that no script runs. */}
+        <noscript>
+          <iframe
+            src={`https://www.googletagmanager.com/ns.html?id=${GTM_ID}`}
+            height="0"
+            width="0"
+            style={{ display: "none", visibility: "hidden" }}
+          />
+        </noscript>
+
+        <DisableContextMenu />
+        {/* Google Analytics */}
+        <Script
+          src="https://www.googletagmanager.com/gtag/js?id=G-BCH1QGTJKD"
+          strategy="afterInteractive"
+        />
+
+        <Script id="google-analytics" strategy="afterInteractive">
+          {`
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){window.dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', 'G-BCH1QGTJKD');
+          `}
+        </Script>
+
+        {/* Microsoft Clarity */}
+        <Script id="microsoft-clarity" strategy="afterInteractive">
+          {`
+            (function(c,l,a,r,i,t,y){
+                c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};
+                t=l.createElement(r);t.async=1;t.src="https://www.clarity.ms/tag/"+i;
+                y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);
+            })(window, document, "clarity", "script", "yelyd96n8n");
+          `}
+        </Script>
+
+        {/* Session at the root, not just under /learn. Checkout needs to know
+            whether the visitor already owns the course, and the sign-in form
+            reappearing on a signed-in browser was the same gap seen from the
+            other side. It costs anonymous visitors nothing: the provider only
+            reaches for a session when the da_session hint cookie says there
+            might be one. */}
+        <AcademyAuthProvider>
+          <ContactProvider>
+            <EpisodeProvider>
+              <SiteChrome>{children}</SiteChrome>
+            </EpisodeProvider>
+          </ContactProvider>
+        </AcademyAuthProvider>
+      </body>
+    </html>
+  );
+}
